@@ -4,6 +4,7 @@
 #include "indicator.h"
 #include "overlay.h"
 #include "switcher.h"
+#include "edge_flash.h"
 
 #ifndef VK_F23
 #define VK_F23 0x86
@@ -29,16 +30,6 @@ HWND g_msg_hwnd = nullptr;
 
 const std::vector<hotkey::Binding> g_bindings = {
     {
-        .id = 1,
-        .modifiers = MOD_CONTROL | MOD_SHIFT,
-        .vk = 'P',
-        .action = [] {
-            POINT pt;
-            GetCursorPos(&pt);
-            overlay::show(pt.x, pt.y, L"\u30c6\u30b9\u30c8\u8868\u793a");
-        },
-    },
-    {
         .id = 10,
         .modifiers = MOD_ALT,
         .vk = VK_OEM_MINUS,
@@ -62,18 +53,14 @@ LRESULT CALLBACK msg_wndproc(HWND hwnd, UINT msg,
                              WPARAM wParam, LPARAM lParam) {
     if (msg == WM_HOTKEY) {
         if (wParam == kToggleHotkeyId) {
-            POINT pt;
-            GetCursorPos(&pt);
             g_hotkeys_active = !g_hotkeys_active;
             if (g_hotkeys_active) {
                 hotkey::register_all(hwnd, g_bindings);
                 indicator::show();
-                overlay::show(pt.x, pt.y, L"Hotkeys ON");
             } else {
                 hotkey::unregister_all(hwnd, g_bindings);
                 switcher::hide();
                 indicator::hide();
-                overlay::show(pt.x, pt.y, L"Hotkeys OFF");
             }
             return 0;
         }
@@ -89,6 +76,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     if (!overlay::init(hInstance)) return 1;
     if (!indicator::init(hInstance)) return 1;
     if (!switcher::init(hInstance)) return 1;
+    if (!edge_flash::init(hInstance)) return 1;
 
     // Create hidden message-only window for hotkey events
     WNDCLASSEXW wc = {};
@@ -125,6 +113,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     // Cleanup
+    edge_flash::shutdown();
     switcher::shutdown();
     indicator::shutdown();
     UnregisterHotKey(g_msg_hwnd, kToggleHotkeyId);

@@ -1,10 +1,12 @@
 #include "switcher.h"
 #include "indicator.h"
+#include "edge_flash.h"
 #include <string>
 #include <vector>
 #include <cstdint>
 #include <cwctype>
 #include <unordered_map>
+#include <algorithm>
 
 namespace switcher {
 namespace {
@@ -27,9 +29,28 @@ constexpr COLORREF kChipColor = RGB(42, 42, 64);     // #2A2A40
 constexpr COLORREF kSelectedColor = RGB(0, 140, 180); // #008CB4 accent
 constexpr COLORREF kTextColor = RGB(255, 255, 255);
 
+// Animation
+constexpr UINT_PTR kFocusTimerId = 1;
+constexpr UINT_PTR kAnimTimerId = 2;
+constexpr DWORD kFocusPollMs = 100;
+constexpr DWORD kAnimFrameMs = 16;    // ~60 fps
+constexpr DWORD kChipAnimMs = 400;    // each chip fade-in duration
+constexpr DWORD kChipStaggerMs = 100; // delay between consecutive chips
+constexpr int kSlideDistance = 8;     // px slide-up on intro
+constexpr DWORD kFadeOutMs = 300;
+constexpr BYTE kPanelAlpha = 230;     // steady-state SourceConstantAlpha
+
+enum class AnimState { IDLE, INTRO, VISIBLE, FADEOUT };
+
 struct WindowEntry {
     HWND hwnd;
     std::wstring title;
+};
+
+struct ChipLayout {
+    std::wstring text;
+    int x;
+    int width;
 };
 
 HINSTANCE g_hInstance = nullptr;
@@ -37,15 +58,20 @@ HWND g_hwnd = nullptr;
 HDC g_hdcMem = nullptr;
 HBITMAP g_hbmp = nullptr;
 uint32_t* g_pixels = nullptr;
-int g_bmpWidth = 0;
-int g_bmpHeight = 0;
 
 std::vector<WindowEntry> g_windows;
 int g_cursor = -1;
 
-// Focus tracking via polling (replaces SetWinEventHook which is blocked)
-constexpr UINT_PTR kFocusTimerId = 1;
-constexpr DWORD kFocusPollMs = 100;
+// Layout cache
+std::vector<ChipLayout> g_chips;
+int g_itemHeight = 0;
+int g_panelW = 0;
+int g_panelH = 0;
+POINT g_panelPos = {};
+
+// Animation state
+AnimState g_state = AnimState::IDLE;
+ULONGLONG g_animStart = 0;
 
 // Window class names to exclude (our own windows)
 constexpr const wchar_t* kExcludeClasses[] = {
@@ -53,6 +79,7 @@ constexpr const wchar_t* kExcludeClasses[] = {
     L"CustomKeypadOverlay",
     L"CustomKeypadSwitcher",
     L"CustomKeypadMsg",
+    L"CustomKeypadEdgeFlash",
 };
 
 // Process names to exclude from the window list
@@ -100,19 +127,16 @@ std::wstring get_display_name(HWND hwnd) {
 
     if (!ok) return L"";
 
-    // Extract filename from path
     std::wstring fullPath(path, pathLen);
     size_t lastSlash = fullPath.find_last_of(L'\\');
     std::wstring filename = (lastSlash != std::wstring::npos)
         ? fullPath.substr(lastSlash + 1) : fullPath;
 
-    // Remove .exe extension
     size_t dotPos = filename.find_last_of(L'.');
     if (dotPos != std::wstring::npos) {
         filename = filename.substr(0, dotPos);
     }
 
-    // Check friendly name mapping (case-insensitive)
     std::wstring lower = filename;
     for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
 
@@ -122,7 +146,6 @@ std::wstring get_display_name(HWND hwnd) {
         }
     }
 
-    // Fallback: return exe name as-is
     return filename;
 }
 
@@ -149,11 +172,9 @@ BOOL CALLBACK enum_callback(HWND hwnd, LPARAM lParam) {
     LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
 
-    // Only list windows that would appear in the taskbar
     HWND owner = GetWindow(hwnd, GW_OWNER);
     if (owner != nullptr && !(exStyle & WS_EX_APPWINDOW)) return TRUE;
 
-    // Exclude our own windows by class name
     wchar_t cls[128] = {};
     GetClassNameW(hwnd, cls, 128);
     for (const auto* exc : kExcludeClasses) {
@@ -162,12 +183,10 @@ BOOL CALLBACK enum_callback(HWND hwnd, LPARAM lParam) {
 
     std::wstring display = get_display_name(hwnd);
 
-    // Exclude by process name
     for (const auto* exc : kExcludeProcesses) {
         if (display == exc) return TRUE;
     }
     if (display.empty()) {
-        // Fallback to window title
         std::wstring title(len + 1, L'\0');
         GetWindowTextW(hwnd, title.data(), len + 1);
         title.resize(len);
@@ -183,7 +202,7 @@ void enumerate_windows() {
     g_cursor = -1;
     EnumWindows(enum_callback, reinterpret_cast<LPARAM>(&g_windows));
 
-    // Disambiguate duplicate titles: "App" -> "App (1)", "App (2)"
+    // Disambiguate duplicate titles
     std::unordered_map<std::wstring, int> counts;
     for (const auto& w : g_windows) counts[w.title]++;
 
@@ -200,8 +219,6 @@ void free_bitmap() {
     if (g_hbmp) { DeleteObject(g_hbmp); g_hbmp = nullptr; }
     if (g_hdcMem) { DeleteDC(g_hdcMem); g_hdcMem = nullptr; }
     g_pixels = nullptr;
-    g_bmpWidth = 0;
-    g_bmpHeight = 0;
 }
 
 void create_bitmap(int w, int h) {
@@ -223,23 +240,15 @@ void create_bitmap(int w, int h) {
     g_hbmp = CreateDIBSection(g_hdcMem, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
     g_pixels = static_cast<uint32_t*>(bits);
     SelectObject(g_hdcMem, g_hbmp);
-    g_bmpWidth = w;
-    g_bmpHeight = h;
 }
 
-void render() {
-    if (!g_hwnd || g_windows.empty()) return;
-
-    // Measure all items
+// Compute layout metrics (text measurement + positions)
+void compute_layout() {
     HDC hdcScreen = GetDC(nullptr);
     HFONT font = create_font();
     HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(hdcScreen, font));
 
-    struct ItemMetrics {
-        std::wstring text;
-        int width;
-    };
-    std::vector<ItemMetrics> metrics;
+    g_chips.clear();
     int total_width = kPanelPaddingX * 2;
     int text_height = 0;
 
@@ -254,82 +263,155 @@ void render() {
         if (sz.cy > text_height) text_height = sz.cy;
         int item_w = sz.cx + kItemPaddingX * 2;
         total_width += item_w;
-        metrics.push_back({std::move(display), item_w});
+        g_chips.push_back({std::move(display), 0, item_w});
     }
-    if (!metrics.empty()) {
-        total_width += kItemSpacing * (static_cast<int>(metrics.size()) - 1);
+    if (!g_chips.empty()) {
+        total_width += kItemSpacing * (static_cast<int>(g_chips.size()) - 1);
     }
 
     SelectObject(hdcScreen, oldFont);
     DeleteObject(font);
     ReleaseDC(nullptr, hdcScreen);
 
-    int item_height = text_height + kItemPaddingY * 2;
-    int panel_height = item_height + kPanelPaddingY * 2;
-    int panel_width = total_width;
+    g_itemHeight = text_height + kItemPaddingY * 2;
+    g_panelH = g_itemHeight + kPanelPaddingY * 2;
+    g_panelW = total_width;
 
-    // Create/resize DIB
-    create_bitmap(panel_width, panel_height);
-    if (!g_pixels) return;
+    // X positions
+    int x = kPanelPaddingX;
+    for (auto& cl : g_chips) {
+        cl.x = x;
+        x += cl.width + kItemSpacing;
+    }
 
-    // Fill background
+    // Final position (relative to indicator)
+    RECT ind = indicator::get_rect();
+    int ind_center_y = (ind.top + ind.bottom) / 2;
+    g_panelPos = {ind.right + kGap, ind_center_y - g_panelH / 2};
+
+    if (ind.right == 0 && ind.bottom == 0) {
+        RECT workArea;
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+        g_panelPos = {workArea.left + 40, workArea.bottom - g_panelH - 8};
+    }
+}
+
+// Render one frame. progress: 0.0 (start of intro) to 1.0 (fully visible)
+void render_frame(float global_progress) {
+    if (!g_hwnd || !g_pixels || g_chips.empty()) return;
+
+    int n = static_cast<int>(g_chips.size());
+
+    // 1. Draw panel background
     HBRUSH bgBrush = CreateSolidBrush(kBgColor);
-    RECT full = {0, 0, panel_width, panel_height};
+    RECT full = {0, 0, g_panelW, g_panelH};
     FillRect(g_hdcMem, &full, bgBrush);
     DeleteObject(bgBrush);
 
-    // Draw chips and text
+    // Fix bg alpha
+    for (int i = 0; i < g_panelW * g_panelH; ++i)
+        g_pixels[i] |= 0xFF000000;
+
+    // 2. Draw each chip with per-chip animation
     SetBkMode(g_hdcMem, TRANSPARENT);
     SetTextColor(g_hdcMem, kTextColor);
-    font = create_font();
+    HFONT font = create_font();
     HFONT oldF = reinterpret_cast<HFONT>(SelectObject(g_hdcMem, font));
 
-    int x = kPanelPaddingX;
-    for (size_t i = 0; i < metrics.size(); ++i) {
-        RECT chip = {x, kPanelPaddingY,
-                     x + metrics[i].width, kPanelPaddingY + item_height};
+    // Compute total intro time for stagger scaling
+    DWORD totalMs = kChipAnimMs + (n > 1 ? (n - 1) * kChipStaggerMs : 0);
 
-        COLORREF color = (static_cast<int>(i) == g_cursor) ? kSelectedColor : kChipColor;
+    for (int i = 0; i < n; ++i) {
+        // Per-chip progress with stagger
+        float delay = static_cast<float>(i * kChipStaggerMs) / totalMs;
+        float chipDur = static_cast<float>(kChipAnimMs) / totalMs;
+        float chip_t = std::clamp((global_progress - delay) / chipDur, 0.0f, 1.0f);
+        // Ease-out quadratic
+        float progress = 1.0f - (1.0f - chip_t) * (1.0f - chip_t);
+
+        if (progress <= 0.001f) continue;
+
+        auto& cl = g_chips[i];
+        RECT chip = {cl.x, kPanelPaddingY,
+                     cl.x + cl.width, kPanelPaddingY + g_itemHeight};
+
+        // Save background pixels before chip drawing
+        int cw = chip.right - chip.left;
+        int ch = chip.bottom - chip.top;
+        std::vector<uint32_t> bg_saved(cw * ch);
+        for (int cy = 0; cy < ch; ++cy)
+            for (int cx = 0; cx < cw; ++cx)
+                bg_saved[cy * cw + cx] =
+                    g_pixels[(chip.top + cy) * g_panelW + chip.left + cx];
+
+        // Draw chip rect + text
+        COLORREF color = (i == g_cursor) ? kSelectedColor : kChipColor;
         HBRUSH chipBrush = CreateSolidBrush(color);
         FillRect(g_hdcMem, &chip, chipBrush);
         DeleteObject(chipBrush);
-
-        DrawTextW(g_hdcMem, metrics[i].text.c_str(), -1, &chip,
+        DrawTextW(g_hdcMem, cl.text.c_str(), -1, &chip,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-        x += metrics[i].width + kItemSpacing;
+        // Blend chip over saved bg with per-chip progress
+        if (progress >= 0.999f) {
+            for (int cy = 0; cy < ch; ++cy)
+                for (int cx = 0; cx < cw; ++cx)
+                    g_pixels[(chip.top + cy) * g_panelW + chip.left + cx] |=
+                        0xFF000000;
+        } else {
+            uint32_t p8 = static_cast<uint32_t>(progress * 255.0f);
+            uint32_t ip8 = 255 - p8;
+            for (int cy = 0; cy < ch; ++cy) {
+                for (int cx = 0; cx < cw; ++cx) {
+                    uint32_t bg = bg_saved[cy * cw + cx];
+                    uint32_t& pixel =
+                        g_pixels[(chip.top + cy) * g_panelW + chip.left + cx];
+                    uint32_t bR = (bg >> 16) & 0xFF;
+                    uint32_t bG = (bg >> 8) & 0xFF;
+                    uint32_t bB = bg & 0xFF;
+                    uint32_t cR = (pixel >> 16) & 0xFF;
+                    uint32_t cG = (pixel >> 8) & 0xFF;
+                    uint32_t cB = pixel & 0xFF;
+                    uint32_t fR = (bR * ip8 + cR * p8) / 255;
+                    uint32_t fG = (bG * ip8 + cG * p8) / 255;
+                    uint32_t fB = (bB * ip8 + cB * p8) / 255;
+                    pixel = 0xFF000000 | (fR << 16) | (fG << 8) | fB;
+                }
+            }
+        }
     }
 
     SelectObject(g_hdcMem, oldF);
     DeleteObject(font);
 
-    // Fix alpha channel: GDI writes alpha as 0x00, set all to 0xFF
-    for (int py = 0; py < panel_height; ++py) {
-        for (int px = 0; px < panel_width; ++px) {
-            g_pixels[py * panel_width + px] |= 0xFF000000;
-        }
-    }
+    // 3. Position with slide-up offset
+    float slide_t = std::clamp(global_progress * 2.0f, 0.0f, 1.0f);
+    float slide_ease = 1.0f - (1.0f - slide_t) * (1.0f - slide_t);
+    int dy = static_cast<int>((1.0f - slide_ease) * kSlideDistance);
 
-    // Position relative to indicator
-    RECT ind = indicator::get_rect();
-    int ind_center_y = (ind.top + ind.bottom) / 2;
-    POINT ptDst = {ind.right + kGap, ind_center_y - panel_height / 2};
-
-    // Fallback if indicator is not visible
-    if (ind.right == 0 && ind.bottom == 0) {
-        RECT workArea;
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
-        ptDst = {workArea.left + 40, workArea.bottom - panel_height - 8};
-    }
-
-    SIZE sizeWnd = {panel_width, panel_height};
+    POINT ptDst = {g_panelPos.x, g_panelPos.y + dy};
+    SIZE sizeWnd = {g_panelW, g_panelH};
     POINT ptSrc = {0, 0};
     BLENDFUNCTION blend = {};
     blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 230;
+    blend.SourceConstantAlpha = kPanelAlpha;
     blend.AlphaFormat = AC_SRC_ALPHA;
     UpdateLayeredWindow(g_hwnd, nullptr, &ptDst, &sizeWnd,
                         g_hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+}
+
+void do_hide() {
+    if (g_hwnd) {
+        KillTimer(g_hwnd, kAnimTimerId);
+        KillTimer(g_hwnd, kFocusTimerId);
+        DestroyWindow(g_hwnd);
+        g_hwnd = nullptr;
+    }
+    free_bitmap();
+    g_windows.clear();
+    g_chips.clear();
+    g_cursor = -1;
+    g_state = AnimState::IDLE;
 }
 
 void focus_current() {
@@ -339,30 +421,75 @@ void focus_current() {
 
     if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
     SetForegroundWindow(target);
+    edge_flash::flash();
 }
 
 void sync_cursor_to_foreground() {
     if (!g_hwnd || g_windows.empty()) return;
+    if (g_state == AnimState::FADEOUT) return;
+
     HWND fg = GetForegroundWindow();
     for (int i = 0; i < static_cast<int>(g_windows.size()); ++i) {
         if (g_windows[i].hwnd == fg) {
             if (g_cursor != i) {
                 g_cursor = i;
-                render();
+                if (g_state == AnimState::VISIBLE)
+                    render_frame(1.0f);
+                // During INTRO, next animation frame picks up new cursor
             }
             return;
         }
     }
     if (g_cursor != -1) {
         g_cursor = -1;
-        render();
+        if (g_state == AnimState::VISIBLE)
+            render_frame(1.0f);
     }
 }
 
 LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == WM_TIMER && wParam == kFocusTimerId) {
-        sync_cursor_to_foreground();
-        return 0;
+    if (msg == WM_TIMER) {
+        if (wParam == kFocusTimerId) {
+            sync_cursor_to_foreground();
+            return 0;
+        }
+        if (wParam == kAnimTimerId) {
+            ULONGLONG now = GetTickCount64();
+            float elapsed = static_cast<float>(now - g_animStart);
+
+            if (g_state == AnimState::INTRO) {
+                int n = static_cast<int>(g_chips.size());
+                DWORD totalMs = kChipAnimMs
+                    + (n > 1 ? (n - 1) * kChipStaggerMs : 0);
+                float t = elapsed / totalMs;
+                if (t >= 1.0f) {
+                    g_state = AnimState::VISIBLE;
+                    KillTimer(g_hwnd, kAnimTimerId);
+                    render_frame(1.0f);
+                } else {
+                    render_frame(t);
+                }
+            } else if (g_state == AnimState::FADEOUT) {
+                float t = elapsed / kFadeOutMs;
+                if (t >= 1.0f) {
+                    do_hide();
+                } else {
+                    // Ease-in quadratic (accelerating fade)
+                    float alpha = 1.0f - t * t;
+                    BYTE a = static_cast<BYTE>(alpha * kPanelAlpha);
+                    POINT ptSrc = {0, 0};
+                    SIZE sizeWnd = {g_panelW, g_panelH};
+                    BLENDFUNCTION blend = {};
+                    blend.BlendOp = AC_SRC_OVER;
+                    blend.SourceConstantAlpha = a;
+                    blend.AlphaFormat = AC_SRC_ALPHA;
+                    UpdateLayeredWindow(g_hwnd, nullptr, nullptr, &sizeWnd,
+                                        g_hdcMem, &ptSrc, 0, &blend,
+                                        ULW_ALPHA);
+                }
+            }
+            return 0;
+        }
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -382,6 +509,12 @@ bool init(HINSTANCE hInstance) {
 }
 
 void toggle() {
+    // Cancel fade-out if in progress
+    if (g_state == AnimState::FADEOUT) {
+        KillTimer(g_hwnd, kAnimTimerId);
+        g_state = AnimState::IDLE;
+    }
+
     enumerate_windows();
     if (g_windows.empty()) {
         hide();
@@ -399,6 +532,10 @@ void toggle() {
         if (!g_hwnd) return;
     }
 
+    compute_layout();
+    create_bitmap(g_panelW, g_panelH);
+    if (!g_pixels) return;
+
     // Set cursor to current foreground window
     HWND fg = GetForegroundWindow();
     g_cursor = -1;
@@ -406,42 +543,72 @@ void toggle() {
         if (g_windows[i].hwnd == fg) { g_cursor = i; break; }
     }
 
-    render();
+    // Start intro animation
+    g_state = AnimState::INTRO;
+    g_animStart = GetTickCount64();
+    render_frame(0.0f);
+
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    SetTimer(g_hwnd, kAnimTimerId, kAnimFrameMs, nullptr);
     SetTimer(g_hwnd, kFocusTimerId, kFocusPollMs, nullptr);
 }
 
 void move_left() {
     if (!g_hwnd || g_windows.empty()) return;
+
+    // Cancel fade-out
+    if (g_state == AnimState::FADEOUT) {
+        KillTimer(g_hwnd, kAnimTimerId);
+        g_state = AnimState::VISIBLE;
+        SetTimer(g_hwnd, kFocusTimerId, kFocusPollMs, nullptr);
+    }
+
     int n = static_cast<int>(g_windows.size());
     if (g_cursor <= 0)
         g_cursor = n - 1;
     else
         g_cursor--;
-    render();
+
+    if (g_state == AnimState::VISIBLE)
+        render_frame(1.0f);
     focus_current();
 }
 
 void move_right() {
     if (!g_hwnd || g_windows.empty()) return;
+
+    // Cancel fade-out
+    if (g_state == AnimState::FADEOUT) {
+        KillTimer(g_hwnd, kAnimTimerId);
+        g_state = AnimState::VISIBLE;
+        SetTimer(g_hwnd, kFocusTimerId, kFocusPollMs, nullptr);
+    }
+
     g_cursor = (g_cursor + 1) % static_cast<int>(g_windows.size());
-    render();
+
+    if (g_state == AnimState::VISIBLE)
+        render_frame(1.0f);
     focus_current();
 }
 
 void hide() {
-    if (g_hwnd) {
-        KillTimer(g_hwnd, kFocusTimerId);
-        DestroyWindow(g_hwnd);
-        g_hwnd = nullptr;
-    }
-    free_bitmap();
-    g_windows.clear();
-    g_cursor = -1;
+    if (!g_hwnd || g_state == AnimState::FADEOUT) return;
+
+    KillTimer(g_hwnd, kFocusTimerId);
+    if (g_state == AnimState::INTRO)
+        KillTimer(g_hwnd, kAnimTimerId);
+
+    // Render final frame for clean fade-out source
+    render_frame(1.0f);
+
+    g_state = AnimState::FADEOUT;
+    g_animStart = GetTickCount64();
+    SetTimer(g_hwnd, kAnimTimerId, kAnimFrameMs, nullptr);
 }
 
 void shutdown() {
-    hide();
+    g_state = AnimState::IDLE;
+    do_hide();
     UnregisterClassW(kClassName, g_hInstance);
 }
 

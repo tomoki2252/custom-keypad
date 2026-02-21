@@ -32,6 +32,7 @@ add_executable(custom-keypad WIN32
   src/hotkey.cpp
   src/indicator.cpp
   src/switcher.cpp
+  src/edge_flash.cpp
 )
 
 target_link_libraries(custom-keypad PRIVATE gdi32 user32)
