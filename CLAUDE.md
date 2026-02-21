@@ -30,8 +30,14 @@ cmake --build build
 ## 実行
 
 ```bash
-./build/custom-keypad.exe   # WSL2 interop経由でWindowsプロセスとして起動
+./build/custom-keypad.exe       # WSL2 interop経由でWindowsプロセスとして起動
+taskkill.exe /IM custom-keypad.exe /F  # 終了
 ```
+
+## ホットキー
+
+- Ctrl+Alt+M: ホットキーON/OFFトグル（画面左下のインジケーター連動）
+- Ctrl+Shift+P: テスト表示（マウスカーソル付近にポップアップ）
 
 ## Git ワークフロー
 
@@ -49,8 +55,9 @@ custom-keypad/
 ├── cmake/
 │   └── mingw-w64-x86_64.cmake   # MinGW-w64クロスコンパイル用ツールチェーン
 ├── src/
-│   ├── main.cpp                  # WinMainエントリ、メッセージループ
-│   ├── overlay.h / overlay.cpp   # オーバーレイポップアップUI
-│   └── hotkey.h / hotkey.cpp     # ホットキー登録・ディスパッチ
+│   ├── main.cpp                      # WinMainエントリ、メッセージループ、トグル管理
+│   ├── overlay.h / overlay.cpp       # オーバーレイポップアップUI
+│   ├── hotkey.h / hotkey.cpp         # ホットキー登録・ディスパッチ
+│   └── indicator.h / indicator.cpp   # アニメーション付きステータスインジケーター
 └── build/                        # .gitignore で除外
 ```
