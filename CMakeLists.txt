@@ -31,6 +31,7 @@ add_executable(custom-keypad WIN32
   src/overlay.cpp
   src/hotkey.cpp
   src/indicator.cpp
+  src/switcher.cpp
 )
 
 target_link_libraries(custom-keypad PRIVATE gdi32 user32)

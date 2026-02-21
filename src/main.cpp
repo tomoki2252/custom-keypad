@@ -3,9 +3,14 @@
 #include "hotkey.h"
 #include "indicator.h"
 #include "overlay.h"
+#include "switcher.h"
 
 #ifndef VK_F23
 #define VK_F23 0x86
+#endif
+
+#ifndef VK_OEM_MINUS
+#define VK_OEM_MINUS 0xBD
 #endif
 
 namespace {
@@ -25,6 +30,12 @@ const std::vector<hotkey::Binding> g_bindings = {
             overlay::show(pt.x, pt.y, L"\u30c6\u30b9\u30c8\u8868\u793a");
         },
     },
+    {
+        .id = 10,
+        .modifiers = MOD_ALT,
+        .vk = VK_OEM_MINUS,
+        .action = [] { switcher::toggle(); },
+    },
 };
 
 LRESULT CALLBACK msg_wndproc(HWND hwnd, UINT msg,
@@ -40,6 +51,7 @@ LRESULT CALLBACK msg_wndproc(HWND hwnd, UINT msg,
                 overlay::show(pt.x, pt.y, L"Hotkeys ON");
             } else {
                 hotkey::unregister_all(hwnd, g_bindings);
+                switcher::hide();
                 indicator::hide();
                 overlay::show(pt.x, pt.y, L"Hotkeys OFF");
             }
@@ -56,6 +68,7 @@ LRESULT CALLBACK msg_wndproc(HWND hwnd, UINT msg,
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     if (!overlay::init(hInstance)) return 1;
     if (!indicator::init(hInstance)) return 1;
+    if (!switcher::init(hInstance)) return 1;
 
     // Create hidden message-only window for hotkey events
     WNDCLASSEXW wc = {};
@@ -92,6 +105,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     // Cleanup
+    switcher::shutdown();
     indicator::shutdown();
     UnregisterHotKey(g_msg_hwnd, kToggleHotkeyId);
     hotkey::unregister_all(g_msg_hwnd, g_bindings);
