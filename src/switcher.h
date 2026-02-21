@@ -4,7 +4,9 @@
 namespace switcher {
 
 bool init(HINSTANCE hInstance);
-void toggle();    // Enumerate windows and show/refresh the list
+void toggle();       // Enumerate + show/refresh list
+void move_left();    // Move cursor left + focus
+void move_right();   // Move cursor right + focus
 void hide();
 void shutdown();
 

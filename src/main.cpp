@@ -13,6 +13,14 @@
 #define VK_OEM_MINUS 0xBD
 #endif
 
+#ifndef VK_OEM_7
+#define VK_OEM_7 0xDE    // '^' on JIS keyboard
+#endif
+
+#ifndef VK_OEM_5
+#define VK_OEM_5 0xDC    // '\' / '¥' on JIS keyboard
+#endif
+
 namespace {
 
 constexpr int kToggleHotkeyId = 9999;
@@ -35,6 +43,18 @@ const std::vector<hotkey::Binding> g_bindings = {
         .modifiers = MOD_ALT,
         .vk = VK_OEM_MINUS,
         .action = [] { switcher::toggle(); },
+    },
+    {
+        .id = 11,
+        .modifiers = MOD_ALT,
+        .vk = VK_OEM_7,
+        .action = [] { switcher::move_left(); },
+    },
+    {
+        .id = 12,
+        .modifiers = MOD_ALT,
+        .vk = VK_OEM_5,
+        .action = [] { switcher::move_right(); },
     },
 };
 

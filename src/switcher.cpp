@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdint>
 #include <cwctype>
+#include <unordered_map>
 
 namespace switcher {
 namespace {
@@ -23,6 +24,7 @@ constexpr int kMaxTitleLen = 24;
 // Colors
 constexpr COLORREF kBgColor = RGB(26, 26, 46);       // #1A1A2E
 constexpr COLORREF kChipColor = RGB(42, 42, 64);     // #2A2A40
+constexpr COLORREF kSelectedColor = RGB(0, 140, 180); // #008CB4 accent
 constexpr COLORREF kTextColor = RGB(255, 255, 255);
 
 struct WindowEntry {
@@ -39,7 +41,11 @@ int g_bmpWidth = 0;
 int g_bmpHeight = 0;
 
 std::vector<WindowEntry> g_windows;
-int g_cursor = -1;  // reserved for step 2-4
+int g_cursor = -1;
+
+// Focus tracking via polling (replaces SetWinEventHook which is blocked)
+constexpr UINT_PTR kFocusTimerId = 1;
+constexpr DWORD kFocusPollMs = 100;
 
 // Window class names to exclude (our own windows)
 constexpr const wchar_t* kExcludeClasses[] = {
@@ -176,6 +182,18 @@ void enumerate_windows() {
     g_windows.clear();
     g_cursor = -1;
     EnumWindows(enum_callback, reinterpret_cast<LPARAM>(&g_windows));
+
+    // Disambiguate duplicate titles: "App" -> "App (1)", "App (2)"
+    std::unordered_map<std::wstring, int> counts;
+    for (const auto& w : g_windows) counts[w.title]++;
+
+    std::unordered_map<std::wstring, int> seen;
+    for (auto& w : g_windows) {
+        if (counts[w.title] > 1) {
+            int idx = ++seen[w.title];
+            w.title += L" (" + std::to_wstring(idx) + L")";
+        }
+    }
 }
 
 void free_bitmap() {
@@ -271,7 +289,8 @@ void render() {
         RECT chip = {x, kPanelPaddingY,
                      x + metrics[i].width, kPanelPaddingY + item_height};
 
-        HBRUSH chipBrush = CreateSolidBrush(kChipColor);
+        COLORREF color = (static_cast<int>(i) == g_cursor) ? kSelectedColor : kChipColor;
+        HBRUSH chipBrush = CreateSolidBrush(color);
         FillRect(g_hdcMem, &chip, chipBrush);
         DeleteObject(chipBrush);
 
@@ -313,7 +332,38 @@ void render() {
                         g_hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
 }
 
+void focus_current() {
+    if (g_cursor < 0 || g_cursor >= static_cast<int>(g_windows.size())) return;
+    HWND target = g_windows[g_cursor].hwnd;
+    if (!IsWindow(target)) return;
+
+    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+    SetForegroundWindow(target);
+}
+
+void sync_cursor_to_foreground() {
+    if (!g_hwnd || g_windows.empty()) return;
+    HWND fg = GetForegroundWindow();
+    for (int i = 0; i < static_cast<int>(g_windows.size()); ++i) {
+        if (g_windows[i].hwnd == fg) {
+            if (g_cursor != i) {
+                g_cursor = i;
+                render();
+            }
+            return;
+        }
+    }
+    if (g_cursor != -1) {
+        g_cursor = -1;
+        render();
+    }
+}
+
 LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_TIMER && wParam == kFocusTimerId) {
+        sync_cursor_to_foreground();
+        return 0;
+    }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
@@ -349,12 +399,39 @@ void toggle() {
         if (!g_hwnd) return;
     }
 
+    // Set cursor to current foreground window
+    HWND fg = GetForegroundWindow();
+    g_cursor = -1;
+    for (int i = 0; i < static_cast<int>(g_windows.size()); ++i) {
+        if (g_windows[i].hwnd == fg) { g_cursor = i; break; }
+    }
+
     render();
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    SetTimer(g_hwnd, kFocusTimerId, kFocusPollMs, nullptr);
+}
+
+void move_left() {
+    if (!g_hwnd || g_windows.empty()) return;
+    int n = static_cast<int>(g_windows.size());
+    if (g_cursor <= 0)
+        g_cursor = n - 1;
+    else
+        g_cursor--;
+    render();
+    focus_current();
+}
+
+void move_right() {
+    if (!g_hwnd || g_windows.empty()) return;
+    g_cursor = (g_cursor + 1) % static_cast<int>(g_windows.size());
+    render();
+    focus_current();
 }
 
 void hide() {
     if (g_hwnd) {
+        KillTimer(g_hwnd, kFocusTimerId);
         DestroyWindow(g_hwnd);
         g_hwnd = nullptr;
     }
