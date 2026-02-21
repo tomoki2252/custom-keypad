@@ -12,16 +12,24 @@ if (CCACHE_PROGRAM)
 endif()
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   add_compile_options(-Wall -Wextra -Wpedantic)
-  # Debugビルド時のサニタイザ（必要に応じて有効化）
-  # if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-  #   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
-  #   add_link_options(-fsanitize=address,undefined)
-  # endif()
-  # moldが入っていれば有効化
   find_program(MOLD_LINKER mold)
   if (MOLD_LINKER)
     add_link_options(-fuse-ld=mold)
   endif()
 endif()
 
-add_executable(custom-keypad src/main.cpp)
+# Unicode (W-suffix API)
+add_compile_definitions(UNICODE _UNICODE)
+
+# UTF-8 source encoding
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8)
+endif()
+
+add_executable(custom-keypad WIN32
+  src/main.cpp
+  src/overlay.cpp
+  src/hotkey.cpp
+)
+
+target_link_libraries(custom-keypad PRIVATE gdi32 user32)
