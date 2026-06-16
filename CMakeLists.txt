@@ -33,6 +33,20 @@ add_executable(custom-keypad WIN32
   src/indicator.cpp
   src/switcher.cpp
   src/edge_flash.cpp
+  src/actions.cpp
+  src/config.cpp
+  src/topmost.cpp
+  src/mouse_hook.cpp
 )
 
 target_link_libraries(custom-keypad PRIVATE gdi32 user32)
+
+# MinGWランタイムを静的リンクし、単体で起動できる exe にする
+# （libstdc++-6.dll / libgcc_s_seh-1.dll への依存をなくす）
+target_link_options(custom-keypad PRIVATE -static -static-libgcc -static-libstdc++)
+
+# config.ini を実行ファイルと同じ場所へコピー（ビルド後）
+add_custom_command(TARGET custom-keypad POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          ${CMAKE_SOURCE_DIR}/config.ini
+          $<TARGET_FILE_DIR:custom-keypad>/config.ini)

@@ -1,6 +1,7 @@
 #include "switcher.h"
 #include "indicator.h"
 #include "edge_flash.h"
+#include "topmost.h"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -28,6 +29,8 @@ constexpr COLORREF kBgColor = RGB(26, 26, 46);       // #1A1A2E
 constexpr COLORREF kChipColor = RGB(42, 42, 64);     // #2A2A40
 constexpr COLORREF kSelectedColor = RGB(0, 140, 180); // #008CB4 accent
 constexpr COLORREF kTextColor = RGB(255, 255, 255);
+constexpr COLORREF kPinColor = RGB(255, 200, 40);    // #FFC828 pinned marker
+constexpr int kPinBarWidth = 3;                       // left-edge stripe width
 
 // Animation
 constexpr UINT_PTR kFocusTimerId = 1;
@@ -45,12 +48,14 @@ enum class AnimState { IDLE, INTRO, VISIBLE, FADEOUT };
 struct WindowEntry {
     HWND hwnd;
     std::wstring title;
+    bool pinned = false;  // window is currently topmost (always-on-top)
 };
 
 struct ChipLayout {
     std::wstring text;
     int x;
     int width;
+    bool pinned = false;
 };
 
 HINSTANCE g_hInstance = nullptr;
@@ -193,7 +198,8 @@ BOOL CALLBACK enum_callback(HWND hwnd, LPARAM lParam) {
         display = std::move(title);
     }
 
-    windows->push_back({hwnd, std::move(display)});
+    bool pinned = (exStyle & WS_EX_TOPMOST) != 0;
+    windows->push_back({hwnd, std::move(display), pinned});
     return TRUE;
 }
 
@@ -263,7 +269,7 @@ void compute_layout() {
         if (sz.cy > text_height) text_height = sz.cy;
         int item_w = sz.cx + kItemPaddingX * 2;
         total_width += item_w;
-        g_chips.push_back({std::move(display), 0, item_w});
+        g_chips.push_back({std::move(display), 0, item_w, w.pinned});
     }
     if (!g_chips.empty()) {
         total_width += kItemSpacing * (static_cast<int>(g_chips.size()) - 1);
@@ -351,6 +357,15 @@ void render_frame(float global_progress) {
         DeleteObject(chipBrush);
         DrawTextW(g_hdcMem, cl.text.c_str(), -1, &chip,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        // Pinned (always-on-top) marker: left-edge accent stripe
+        if (cl.pinned) {
+            RECT bar = {chip.left, chip.top,
+                        chip.left + kPinBarWidth, chip.bottom};
+            HBRUSH pinBrush = CreateSolidBrush(kPinColor);
+            FillRect(g_hdcMem, &bar, pinBrush);
+            DeleteObject(pinBrush);
+        }
 
         // Blend chip over saved bg with per-chip progress
         if (progress >= 0.999f) {
@@ -508,6 +523,20 @@ bool init(HINSTANCE hInstance) {
     return RegisterClassExW(&wc) != 0;
 }
 
+std::wstring display_name(HWND hwnd) {
+    std::wstring name = get_display_name(hwnd);
+    if (name.empty()) {
+        int len = GetWindowTextLengthW(hwnd);
+        std::wstring title(len + 1, L'\0');
+        GetWindowTextW(hwnd, title.data(), len + 1);
+        title.resize(len);
+        name = std::move(title);
+    }
+    if (name.size() > kMaxTitleLen)
+        name = name.substr(0, kMaxTitleLen - 3) + L"...";
+    return name;
+}
+
 void toggle() {
     // Cancel fade-out if in progress
     if (g_state == AnimState::FADEOUT) {
@@ -589,6 +618,33 @@ void move_right() {
     if (g_state == AnimState::VISIBLE)
         render_frame(1.0f);
     focus_current();
+}
+
+void pin_current() {
+    // Operate on the switcher's current selection when open,
+    // otherwise on the current foreground window.
+    HWND target = nullptr;
+    bool have_cursor = g_hwnd && g_cursor >= 0
+                       && g_cursor < static_cast<int>(g_windows.size());
+    if (have_cursor)
+        target = g_windows[g_cursor].hwnd;
+    else
+        target = GetForegroundWindow();
+
+    if (!target || !IsWindow(target)) return;
+
+    bool pinned_now = topmost::toggle(target);
+
+    // Reflect the new state in the overlay (if visible)
+    if (have_cursor) {
+        g_windows[g_cursor].pinned = pinned_now;
+        if (g_cursor < static_cast<int>(g_chips.size()))
+            g_chips[g_cursor].pinned = pinned_now;
+        if (g_state == AnimState::VISIBLE)
+            render_frame(1.0f);
+    }
+
+    edge_flash::flash();
 }
 
 void hide() {
